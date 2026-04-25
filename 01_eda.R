@@ -40,6 +40,9 @@ popularity_threshold <- 68
 top_n_genres      <- 10
 top_n_subgenres   <- 15
 
+# Above this many levels, switch bar plots to a horizontal layout for legibility
+horizontal_threshold <- 20
+
 # Output directories
 fig_dir <- "figures"
 out_dir <- "output"
@@ -113,7 +116,27 @@ if (!is.null(dup_key_expr)) {
   cat(sprintf("Unique row keys                 : %d\n", total_keys))
   cat(sprintf("Keys appearing more than once   : %d\n", nrow(dup_counts)))
   cat(sprintf("Keys appearing in BOTH classes  : %d\n", nrow(cross_class_dup)))
-  cat("(Not auto-removing — review and decide whether/how to dedupe.)\n")
+}
+
+
+# ---- 4b. Deduplication ------------------------------------------------------
+# Strategy: keep one row per track_id, choosing the row with the highest
+# track_popularity. This:
+#   - Resolves cross-class duplicates by keeping the High instance (its
+#     popularity is by definition > the threshold, so it wins automatically).
+#   - Resolves within-class duplicates (same track appearing on multiple
+#     playlists) by keeping the row with the highest popularity score; ties
+#     broken by row order. The audio features are track-level and identical
+#     across rows, so the only thing lost is the alternative playlist
+#     genre/subgenre tag for that track.
+if ("track_id" %in% names(spotify) && "track_popularity" %in% names(spotify)) {
+  n_before <- nrow(spotify)
+  spotify <- spotify %>%
+    arrange(desc(track_popularity)) %>%
+    distinct(track_id, .keep_all = TRUE)
+  cat("\n--- Deduplication (by track_id, max track_popularity wins) ---\n")
+  cat(sprintf("Rows: %d -> %d (%d duplicates removed)\n",
+              n_before, nrow(spotify), n_before - nrow(spotify)))
 }
 
 
@@ -246,12 +269,23 @@ for (v in categorical_vars) {
 }
 
 # --- bar-chart helpers ---
-plot_full_bar <- function(varname) {
-  ggplot(spotify, aes(x = fct_infreq(.data[[varname]]))) +
-    geom_bar(fill = "#3F8FAB") +
-    labs(title = paste("Distribution of", varname),
-         x = varname, y = "Count") +
-    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+plot_full_bar <- function(varname, horizontal = NULL) {
+  if (is.null(horizontal)) {
+    horizontal <- nlevels(spotify[[varname]]) > horizontal_threshold
+  }
+
+  if (horizontal) {
+    ggplot(spotify, aes(y = fct_rev(fct_infreq(.data[[varname]])))) +
+      geom_bar(fill = "#3F8FAB") +
+      labs(title = paste("Distribution of", varname),
+           x = "Count", y = varname)
+  } else {
+    ggplot(spotify, aes(x = fct_infreq(.data[[varname]]))) +
+      geom_bar(fill = "#3F8FAB") +
+      labs(title = paste("Distribution of", varname),
+           x = varname, y = "Count") +
+      theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  }
 }
 
 plot_topn_bar <- function(varname, top_n) {
@@ -274,12 +308,20 @@ plot_topn_bar <- function(varname, top_n) {
 }
 
 for (v in categorical_vars) {
-  n_lvl <- nlevels(spotify[[v]])
+  n_lvl    <- nlevels(spotify[[v]])
+  go_horiz <- n_lvl > horizontal_threshold
 
   p_full <- plot_full_bar(v)
+  if (go_horiz) {
+    fig_w <- 9
+    fig_h <- min(max(6, n_lvl * 0.22), 22)
+  } else {
+    fig_w <- max(6, n_lvl * 0.4)
+    fig_h <- 5
+  }
   ggsave(file.path(fig_dir, sprintf("02_bar_%s_full.png", v)),
          p_full,
-         width = max(6, n_lvl * 0.4), height = 5, dpi = 150)
+         width = fig_w, height = fig_h, dpi = 150)
   print(p_full)
 
   if (v == "playlist_genre" && n_lvl > top_n_genres) {
@@ -319,7 +361,7 @@ print(p_box)
 # ---- 11. Bivariate EDA: categorical predictors vs response ------------------
 # Stacked proportion bars: each bar sums to 100%, fill shows class composition.
 # Useful with imbalanced classes because it normalizes for level frequency.
-plot_cat_vs_response <- function(varname, top_n = NULL) {
+plot_cat_vs_response <- function(varname, top_n = NULL, horizontal = NULL) {
   d <- spotify %>% select(high_popularity, all_of(varname))
 
   if (!is.null(top_n)) {
@@ -335,30 +377,61 @@ plot_cat_vs_response <- function(varname, top_n = NULL) {
     title_suffix <- ""
   }
 
-  d %>%
+  if (is.null(horizontal)) {
+    horizontal <- length(unique(d[[varname]])) > horizontal_threshold
+  }
+
+  d_summary <- d %>%
     count(.data[[varname]], high_popularity) %>%
     group_by(.data[[varname]]) %>%
-    mutate(prop = n / sum(n),
-           level_total = sum(n)) %>%
-    ungroup() %>%
-    ggplot(aes(x = fct_reorder(.data[[varname]], level_total, .desc = TRUE),
-               y = prop, fill = high_popularity)) +
-      geom_col() +
-      scale_y_continuous(labels = percent_format(accuracy = 1)) +
-      scale_fill_manual(values = class_colors) +
-      labs(title    = sprintf("Class composition by %s%s", varname, title_suffix),
-           subtitle = "Each bar = 100%; fill shows share of high- vs. low-popularity tracks",
-           x = varname, y = "Proportion of tracks", fill = "Class") +
-      theme(axis.text.x = element_text(angle = 30, hjust = 1))
+    mutate(prop        = n / sum(n),
+           level_total = sum(n),
+           prop_high   = sum(n[high_popularity == "High"]) / sum(n)) %>%
+    ungroup()
+
+  if (horizontal) {
+    # Horizontal layout, sorted by share of High-popularity tracks.
+    # Bonus interpretation: the most hit-prone levels rise to the top.
+    d_summary %>%
+      ggplot(aes(y    = fct_reorder(.data[[varname]], prop_high),
+                 x    = prop,
+                 fill = high_popularity)) +
+        geom_col() +
+        scale_x_continuous(labels = percent_format(accuracy = 1)) +
+        scale_fill_manual(values = class_colors) +
+        labs(title    = sprintf("Class composition by %s%s", varname, title_suffix),
+             subtitle = "Each row = 100%; sorted by share of High-popularity tracks",
+             x = "Proportion of tracks", y = varname, fill = "Class")
+  } else {
+    d_summary %>%
+      ggplot(aes(x    = fct_reorder(.data[[varname]], level_total, .desc = TRUE),
+                 y    = prop,
+                 fill = high_popularity)) +
+        geom_col() +
+        scale_y_continuous(labels = percent_format(accuracy = 1)) +
+        scale_fill_manual(values = class_colors) +
+        labs(title    = sprintf("Class composition by %s%s", varname, title_suffix),
+             subtitle = "Each bar = 100%; fill shows share of high- vs. low-popularity tracks",
+             x = varname, y = "Proportion of tracks", fill = "Class") +
+        theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  }
 }
 
 for (v in categorical_vars) {
-  n_lvl <- nlevels(spotify[[v]])
+  n_lvl    <- nlevels(spotify[[v]])
+  go_horiz <- n_lvl > horizontal_threshold
 
   p_full <- plot_cat_vs_response(v)
+  if (go_horiz) {
+    fig_w <- 9
+    fig_h <- min(max(6, n_lvl * 0.22), 22)
+  } else {
+    fig_w <- max(7, n_lvl * 0.5)
+    fig_h <- 5
+  }
   ggsave(file.path(fig_dir, sprintf("04_cat_vs_response_%s_full.png", v)),
          p_full,
-         width = max(7, n_lvl * 0.5), height = 5, dpi = 150)
+         width = fig_w, height = fig_h, dpi = 150)
   print(p_full)
 
   if (v == "playlist_genre" && n_lvl > top_n_genres) {
