@@ -209,11 +209,18 @@ spec_rf <- rand_forest(
 
 # `kernlab` does not always learn well-calibrated probabilities; we use AUC
 # (threshold-independent) for tuning to side-step that.
+#
+# Engine options:
+# - cache = 200: kernel-matrix cache size in MB (default is 40, which is
+#   tiny for tuning grids that fit many SVMs back-to-back).
+# - tol = 0.005: SMO termination tolerance (default 0.001). The default is
+#   tighter than this problem needs; relaxing slightly cuts most "maximum
+#   number of iterations reached" warnings without hurting model quality.
 spec_svm <- svm_rbf(
   cost      = tune(),
   rbf_sigma = tune()
 ) %>%
-  set_engine("kernlab") %>%
+  set_engine("kernlab", cache = 200, tol = 0.005) %>%
   set_mode("classification")
 
 # Constrained SVM grid.
@@ -291,8 +298,27 @@ tune_or_resample <- function(wf, name) {
             metrics = tuning_metrics, control = ctrl_grid)
 }
 
+# Selectively muffle kernlab's SMO convergence chatter ("max iterations
+# reached", "line search fails"). These are exploration-time noise — the
+# tuner just discards bad cells and select_best picks from the good ones.
+# All other warnings/errors are passed through normally.
+quiet_kernlab <- function(expr) {
+  withCallingHandlers(
+    expr,
+    warning = function(w) {
+      msg <- conditionMessage(w)
+      if (grepl("maximum number of iterations reached|line search fails",
+                msg, ignore.case = TRUE)) {
+        invokeRestart("muffleWarning")
+      }
+    }
+  )
+}
+
 tic <- Sys.time()
-tuning_results <- imap(all_workflows, ~ tune_or_resample(.x, .y))
+tuning_results <- quiet_kernlab(
+  imap(all_workflows, ~ tune_or_resample(.x, .y))
+)
 toc <- Sys.time()
 cat(sprintf("\nTuning complete. Elapsed: %s\n",
             format(round(difftime(toc, tic, units = "mins"), 2))))
@@ -355,6 +381,128 @@ print(test_metrics %>%
         select(model_label, feature_set, accuracy, roc_auc, sensitivity,
                specificity, precision, f_meas, brier_class) %>%
         mutate(across(where(is.numeric), ~ round(.x, 3))))
+
+
+# ---- 11b. Threshold tuning (CV-based selection, test-set reporting) --------
+# Methodology:
+#   1. Refit each finalized workflow on the CV folds with save_pred = TRUE
+#      to harvest out-of-fold (OOF) predicted probabilities.
+#   2. For each workflow, sweep thresholds in 0.01 steps and choose the one
+#      that maximizes F1 on the OOF predictions.
+#   3. Re-score the test set at each workflow's CV-selected threshold and
+#      report metrics alongside the default-0.5 numbers.
+#
+# This keeps the held-out test set genuinely held out: the threshold is a
+# hyperparameter selected without seeing the test data.
+threshold_grid <- seq(0.05, 0.95, by = 0.01)
+
+cm_metrics_at <- function(truth, prob_high, threshold) {
+  pred_class <- factor(if_else(prob_high >= threshold, "High", "Low"),
+                       levels = levels(truth))
+  acc  <- yardstick::accuracy_vec(truth, pred_class)
+  sens <- yardstick::sensitivity_vec(truth, pred_class)  # High = positive
+  spec <- yardstick::specificity_vec(truth, pred_class)
+  prec <- yardstick::precision_vec(truth, pred_class)
+  f1   <- yardstick::f_meas_vec(truth, pred_class)
+  tibble(threshold   = threshold,
+         accuracy    = acc,
+         sensitivity = sens,
+         specificity = spec,
+         precision   = prec,
+         f_meas      = f1)
+}
+
+# Step 1: harvest OOF predictions for each finalized workflow
+cat("\n--- Refitting finalized workflows on CV folds for OOF predictions ---\n")
+tic <- Sys.time()
+oof_predictions <- imap(final_workflows, function(wf, nm) {
+  cat(sprintf("  [%s]\n", nm))
+  fit_resamples(wf, resamples = cv_resamples,
+                metrics = tuning_metrics,
+                control = control_resamples(save_pred = TRUE,
+                                            parallel_over = "everything")) %>%
+    collect_predictions()
+})
+toc <- Sys.time()
+cat(sprintf("Elapsed: %s\n",
+            format(round(difftime(toc, tic, units = "mins"), 2))))
+
+# Step 2: sweep thresholds on each workflow's OOF predictions and pick best F1
+cv_threshold_sweep <- imap_dfr(oof_predictions, function(p, nm) {
+  map_dfr(threshold_grid,
+          ~ cm_metrics_at(p$high_popularity, p$.pred_High, .x)) %>%
+    mutate(workflow_id = nm)
+}) %>%
+  left_join(wf_meta, by = "workflow_id")
+
+best_thresholds <- cv_threshold_sweep %>%
+  filter(!is.na(f_meas)) %>%
+  group_by(workflow_id) %>%
+  slice_max(f_meas, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(workflow_id, model_label, feature_set,
+         best_threshold = threshold, cv_f1_at_best = f_meas)
+
+cat("\n--- CV-selected F1-optimal thresholds ---\n")
+print(best_thresholds %>%
+        mutate(across(where(is.numeric), ~ round(.x, 3))))
+
+# Step 3: evaluate the test set at each workflow's CV-selected threshold
+test_metrics_tuned <- imap_dfr(test_predictions, function(p, nm) {
+  thr <- best_thresholds %>% filter(workflow_id == nm) %>% pull(best_threshold)
+  cm_metrics_at(p$high_popularity, p$.pred_High, thr) %>%
+    mutate(workflow_id = nm)
+}) %>%
+  left_join(wf_meta, by = "workflow_id") %>%
+  left_join(best_thresholds %>% select(workflow_id, best_threshold),
+            by = "workflow_id") %>%
+  arrange(model, feature_set) %>%
+  select(model_label, feature_set, threshold = best_threshold,
+         accuracy, sensitivity, specificity, precision, f_meas, workflow_id)
+
+cat("\n--- Test-set metrics at CV-selected F1-optimal thresholds ---\n")
+print(test_metrics_tuned %>%
+        select(-workflow_id) %>%
+        mutate(across(where(is.numeric), ~ round(.x, 3))))
+
+# Side-by-side comparison: 0.5 vs CV-selected, on the test set
+threshold_comparison <- bind_rows(
+  test_metrics %>%
+    transmute(workflow_id, model_label, feature_set,
+              threshold = 0.5, scheme = "default (0.5)",
+              accuracy, sensitivity, specificity, precision, f_meas),
+  test_metrics_tuned %>%
+    transmute(workflow_id, model_label, feature_set,
+              threshold, scheme = "CV-tuned (F1)",
+              accuracy, sensitivity, specificity, precision, f_meas)
+) %>%
+  arrange(model_label, feature_set, scheme)
+
+cat("\n--- Threshold comparison: default 0.5 vs CV-tuned (test set) ---\n")
+print(threshold_comparison %>%
+        select(model_label, feature_set, scheme, threshold,
+               sensitivity, specificity, precision, f_meas, accuracy) %>%
+        mutate(across(where(is.numeric), ~ round(.x, 3))),
+      n = Inf)
+
+# F1-vs-threshold sweep plot, with chosen thresholds marked
+p_thresh_sweep <- cv_threshold_sweep %>%
+  ggplot(aes(x = threshold, y = f_meas, color = model_label)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(data = best_thresholds,
+             aes(xintercept = best_threshold, color = model_label),
+             linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+  facet_wrap(~ feature_set) +
+  scale_color_manual(values = model_colors) +
+  scale_x_continuous(breaks = seq(0, 1, 0.1)) +
+  labs(title    = "F1 vs decision threshold (CV out-of-fold predictions)",
+       subtitle = "Dashed lines mark the F1-optimal threshold chosen on CV for each workflow",
+       x = "Threshold for predicting High", y = "F1 (High class)",
+       color = NULL)
+
+ggsave(file.path(fig_dir, "threshold_sweep_f1.png"),
+       p_thresh_sweep, width = 11, height = 5.5, dpi = 150)
+print(p_thresh_sweep)
 
 
 # ---- 12. Per-model plots ---------------------------------------------------
@@ -626,7 +774,15 @@ if (nrow(separated) > 0) {
 
 lr_coefs_plot <- lr_coefs %>% filter(std.error <= sep_threshold_se)
 
-coef_xlim <- c(-1.0, 1.0)
+# Auto-zoom: fit the actual range of (non-separated) CIs with 10% padding.
+# Avoids the empty-space problem when the maximum |estimate| is well below
+# a hard-coded limit, while still guaranteeing the dashed zero line is in
+# the plot region.
+ci_range  <- range(c(lr_coefs_plot$conf.low, lr_coefs_plot$conf.high),
+                   na.rm = TRUE)
+ci_pad    <- 0.10 * diff(ci_range)
+coef_xlim <- c(min(ci_range[1] - ci_pad, -0.05),
+               max(ci_range[2] + ci_pad,  0.05))
 plot_subtitle <- if (nrow(separated) > 0) {
   sprintf("Standardized inputs; positive = predicts High popularity. %d term(s) excluded due to quasi-separation; see console.",
           nrow(separated))
@@ -782,10 +938,15 @@ saveRDS(test_metrics,     file.path(out_dir, "test_metrics.rds"))
 saveRDS(cv_metrics,       file.path(out_dir, "cv_metrics.rds"))
 saveRDS(all_perm_imp,     file.path(out_dir, "permutation_importance.rds"))
 saveRDS(best_params_list, file.path(out_dir, "best_hyperparameters.rds"))
+saveRDS(best_thresholds,      file.path(out_dir, "best_thresholds.rds"))
+saveRDS(test_metrics_tuned,   file.path(out_dir, "test_metrics_tuned.rds"))
+saveRDS(threshold_comparison, file.path(out_dir, "threshold_comparison.rds"))
 
 # Plain-text summary
 write_csv(test_metrics,
           file.path(out_dir, "test_metrics_summary.csv"))
+write_csv(threshold_comparison,
+          file.path(out_dir, "threshold_comparison.csv"))
 
 cat("\n",
     "============================================================\n",
@@ -796,10 +957,13 @@ cat("\n",
     " Saved RDS files:\n",
     "   final_workflows.rds       - 6 fitted workflows (train-fit)\n",
     "   test_predictions.rds      - test-set predictions per workflow\n",
-    "   test_metrics.rds          - tidy test-set metrics table\n",
+    "   test_metrics.rds          - tidy test-set metrics table (thr=0.5)\n",
     "   cv_metrics.rds            - CV metrics at best hyperparameters\n",
     "   permutation_importance.rds- cross-model perm importance\n",
     "   best_hyperparameters.rds  - tuned hyperparameter values\n",
+    "   best_thresholds.rds       - CV F1-optimal threshold per workflow\n",
+    "   test_metrics_tuned.rds    - test-set metrics at CV-tuned thresholds\n",
+    "   threshold_comparison.rds  - default-0.5 vs CV-tuned, side by side\n",
     "============================================================\n",
     sep = "")
 
@@ -807,3 +971,4 @@ cat("\n",
 if (use_parallel) {
   try(doParallel::stopImplicitCluster(), silent = TRUE)
 }
+
