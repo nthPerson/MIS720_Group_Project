@@ -49,13 +49,28 @@ out_dir <- "output"
 dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
-# Plot theme + class colors used throughout
+# Plot theme used throughout
 theme_set(theme_minimal(base_size = 11) +
             theme(plot.title    = element_text(face = "bold"),
                   plot.subtitle = element_text(color = "grey30"),
                   strip.text    = element_text(face = "bold")))
 
-class_colors <- c("Low" = "#E07B5C", "High" = "#3F8FAB")
+
+# ---- 1b. Color scheme configuration ----------------------------------------
+# Spotify-inspired palette (https://www.color-hex.com/color-palette/53188).
+# Edit the base tokens below and the change propagates to every plot.
+spotify_green       <- "#1db954"   # primary brand accent
+spotify_dark        <- "#212121"   # near-black
+spotify_grey_dark   <- "#535353"   # medium-dark grey
+spotify_grey_light  <- "#b3b3b3"   # light grey
+contrast_accent     <- "#E07B5C"   # coral, for diverging palettes & emphasis
+
+# Semantic assignments built from the tokens above
+class_colors         <- c(Low = spotify_grey_dark, High = spotify_green)
+accent_primary       <- spotify_green        # single-color bars / histograms
+threshold_line_color <- contrast_accent      # popularity-cutoff dashed line
+corr_palette         <- c(contrast_accent, "white", spotify_green)  # diverging
+pb_bar_colors        <- c(`TRUE` = spotify_green, `FALSE` = contrast_accent)
 
 
 # ---- 2. Load raw files ------------------------------------------------------
@@ -229,7 +244,7 @@ p_hist <- spotify %>%
   select(all_of(predictor_cont)) %>%
   pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
   ggplot(aes(x = value)) +
-    geom_histogram(fill = "#3F8FAB", color = "white", bins = 40) +
+    geom_histogram(fill = accent_primary, color = "white", bins = 40) +
     facet_wrap(~ variable, scales = "free", ncol = 3) +
     labs(title    = "Distributions of continuous audio features",
          subtitle = "Combined dataset (high + low popularity tracks)",
@@ -242,11 +257,11 @@ print(p_hist)
 # Dedicated plot for track_popularity with threshold marked
 if ("track_popularity" %in% continuous_vars) {
   p_pop <- ggplot(spotify, aes(x = track_popularity)) +
-    geom_histogram(fill = "#3F8FAB", color = "white", bins = 50) +
+    geom_histogram(fill = accent_primary, color = "white", bins = 50) +
     geom_vline(xintercept = popularity_threshold,
-               color = "#E07B5C", linewidth = 0.9, linetype = "dashed") +
+               color = threshold_line_color, linewidth = 0.9, linetype = "dashed") +
     annotate("text", x = popularity_threshold + 1, y = Inf, vjust = 2,
-             hjust = 0, color = "#E07B5C",
+             hjust = 0, color = threshold_line_color,
              label = paste0("Threshold = ", popularity_threshold)) +
     labs(title    = "Distribution of track_popularity",
          subtitle = "Dashed line marks the high/low split used to build the response",
@@ -276,12 +291,12 @@ plot_full_bar <- function(varname, horizontal = NULL) {
 
   if (horizontal) {
     ggplot(spotify, aes(y = fct_rev(fct_infreq(.data[[varname]])))) +
-      geom_bar(fill = "#3F8FAB") +
+      geom_bar(fill = accent_primary) +
       labs(title = paste("Distribution of", varname),
            x = "Count", y = varname)
   } else {
     ggplot(spotify, aes(x = fct_infreq(.data[[varname]]))) +
-      geom_bar(fill = "#3F8FAB") +
+      geom_bar(fill = accent_primary) +
       labs(title = paste("Distribution of", varname),
            x = varname, y = "Count") +
       theme(axis.text.x = element_text(angle = 30, hjust = 1))
@@ -301,7 +316,7 @@ plot_topn_bar <- function(varname, top_n) {
                             other_level = "Other")) %>%
     count(.lvl) %>%
     ggplot(aes(x = fct_reorder(.lvl, n, .desc = TRUE), y = n)) +
-      geom_col(fill = "#3F8FAB") +
+      geom_col(fill = accent_primary) +
       labs(title = sprintf("Top %d %s (rest grouped as 'Other')", top_n, varname),
            x = varname, y = "Count") +
       theme(axis.text.x = element_text(angle = 30, hjust = 1))
@@ -461,7 +476,7 @@ p_corr <- ggcorrplot(cor_mat,
                      type     = "lower",
                      lab      = TRUE,
                      lab_size = 3,
-                     colors   = c("#E07B5C", "white", "#3F8FAB"),
+                     colors   = corr_palette,
                      title    = "Pearson correlation among continuous audio features") +
   theme(plot.title = element_text(face = "bold"))
 
@@ -488,7 +503,7 @@ p_pb <- pb_tbl %>%
              fill = point_biserial > 0)) +
     geom_col() +
     coord_flip() +
-    scale_fill_manual(values = c(`TRUE` = "#3F8FAB", `FALSE` = "#E07B5C"),
+    scale_fill_manual(values = pb_bar_colors,
                       guide  = "none") +
     labs(title    = "Point-biserial correlation: each predictor vs. high_popularity",
          subtitle = "Positive = predictor higher among hits; negative = lower",

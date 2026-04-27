@@ -71,19 +71,37 @@ default_threshold <- 0.5
 use_parallel <- TRUE
 n_cores      <- max(1, parallel::detectCores() - 1)
 
-# Theme + colors (kept consistent with 01_eda.R)
+# Theme (kept consistent with 01_eda.R)
 theme_set(theme_minimal(base_size = 11) +
             theme(plot.title       = element_text(face = "bold"),
                   plot.subtitle    = element_text(color = "grey30"),
                   strip.text       = element_text(face = "bold"),
                   legend.position  = "bottom"))
 
-# Color palettes
-model_colors <- c(`Logistic Regression` = "#3F8FAB",
-                  `Random Forest`       = "#7BAB3F",
-                  `SVM (RBF)`           = "#AB3F8F")
-fset_palette <- c(audio = "#E07B5C", `audio+genre` = "#3F8FAB")
-class_colors <- c(Low = "#E07B5C", High = "#3F8FAB")
+
+# ---- 1b. Color scheme configuration ----------------------------------------
+# Spotify-inspired palette (https://www.color-hex.com/color-palette/53188).
+# Edit the base tokens below and the change propagates to every plot.
+spotify_green       <- "#1db954"   # primary brand accent
+spotify_dark        <- "#212121"   # near-black
+spotify_grey_dark   <- "#535353"   # medium-dark grey
+spotify_grey_light  <- "#b3b3b3"   # light grey
+contrast_accent     <- "#E07B5C"   # coral, for diverging palettes & emphasis
+
+# Semantic assignments built from the tokens above
+class_colors         <- c(Low = spotify_grey_dark, High = spotify_green)
+model_colors         <- c(`Logistic Regression` = spotify_grey_dark,
+                          `Random Forest`       = spotify_green,
+                          `SVM (RBF)`           = contrast_accent)
+fset_palette         <- c(audio = contrast_accent, `audio+genre` = spotify_green)
+sig_colors           <- c(`p < 0.001` = spotify_green,
+                          `p < 0.01`  = spotify_dark,
+                          `p < 0.05`  = spotify_grey_dark,
+                          `n.s.`      = spotify_grey_light)
+accent_primary       <- spotify_green        # single-accent ROC/PR/calibration/density
+threshold_line_color <- contrast_accent      # density-plot threshold marker
+reference_line_color <- spotify_grey_light   # zero/diagonal reference dashes
+errorbar_color       <- spotify_dark         # error bars on importance plot
 
 # Set up parallel backend
 if (use_parallel && requireNamespace("doParallel", quietly = TRUE)) {
@@ -515,7 +533,7 @@ plot_confusion <- function(preds, title) {
   cm <- preds %>%
     conf_mat(truth = high_popularity, estimate = .pred_class)
   autoplot(cm, type = "heatmap") +
-    scale_fill_gradient(low = "white", high = "#3F8FAB") +
+    scale_fill_gradient(low = "white", high = accent_primary) +
     labs(title    = title,
          subtitle = sprintf("Confusion matrix at threshold = %.2f",
                             default_threshold))
@@ -531,8 +549,8 @@ plot_roc_one <- function(preds, title) {
     roc_curve(truth = high_popularity, .pred_High) %>%
     ggplot(aes(x = 1 - specificity, y = sensitivity)) +
     geom_abline(slope = 1, intercept = 0, linetype = "dashed",
-                color = "grey60") +
-    geom_path(linewidth = 0.9, color = "#3F8FAB") +
+                color = reference_line_color) +
+    geom_path(linewidth = 0.9, color = accent_primary) +
     coord_equal() +
     annotate("label", x = 0.65, y = 0.1, hjust = 0,
              label = sprintf("AUC = %.3f", auc_val)) +
@@ -549,7 +567,7 @@ plot_pr_one <- function(preds, title) {
   preds %>%
     pr_curve(truth = high_popularity, .pred_High) %>%
     ggplot(aes(x = recall, y = precision)) +
-    geom_path(linewidth = 0.9, color = "#3F8FAB") +
+    geom_path(linewidth = 0.9, color = accent_primary) +
     coord_equal() +
     annotate("label", x = 0.05, y = 0.1, hjust = 0,
              label = sprintf("AP = %.3f", ap_val)) +
@@ -568,9 +586,9 @@ plot_calibration <- function(preds, title) {
               n         = n(), .groups = "drop") %>%
     ggplot(aes(x = mean_pred, y = actual)) +
     geom_abline(slope = 1, intercept = 0,
-                linetype = "dashed", color = "grey50") +
-    geom_line(color = "#3F8FAB") +
-    geom_point(aes(size = n), color = "#3F8FAB") +
+                linetype = "dashed", color = reference_line_color) +
+    geom_line(color = accent_primary) +
+    geom_point(aes(size = n), color = accent_primary) +
     scale_x_continuous(limits = c(0, 1)) +
     scale_y_continuous(limits = c(0, 1)) +
     coord_equal() +
@@ -586,7 +604,7 @@ plot_proba_density <- function(preds, title) {
   ggplot(preds, aes(x = .pred_High, fill = high_popularity)) +
     geom_density(alpha = 0.55) +
     geom_vline(xintercept = default_threshold,
-               linetype = "dashed", color = "grey40") +
+               linetype = "dashed", color = threshold_line_color) +
     scale_fill_manual(values = class_colors) +
     labs(title    = title,
          subtitle = "Predicted P(High) by true class (test set)",
@@ -628,7 +646,7 @@ all_roc <- imap_dfr(test_predictions, function(preds, wf_id) {
 p_roc_all <- all_roc %>%
   ggplot(aes(x = 1 - specificity, y = sensitivity, color = model_label)) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed",
-              color = "grey60") +
+              color = reference_line_color) +
   geom_path(linewidth = 0.9) +
   facet_wrap(~ feature_set) +
   scale_color_manual(values = model_colors) +
@@ -711,7 +729,7 @@ all_calib <- imap_dfr(test_predictions, function(preds, wf_id) {
 p_calib_all <- all_calib %>%
   ggplot(aes(x = mean_pred, y = actual, color = model_label)) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed",
-              color = "grey50") +
+              color = reference_line_color) +
   geom_line(linewidth = 0.7) +
   geom_point(aes(size = n)) +
   facet_wrap(~ feature_set) +
@@ -795,13 +813,11 @@ p_lr_coef <- lr_coefs_plot %>%
   mutate(term = fct_reorder(term, estimate)) %>%
   ungroup() %>%
   ggplot(aes(x = estimate, y = term)) +
-  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             color = reference_line_color) +
   geom_pointrange(aes(xmin = conf.low, xmax = conf.high, color = sig)) +
   facet_wrap(~ feature_set, scales = "free_y") +
-  scale_color_manual(values = c("p < 0.001" = "#3F8FAB",
-                                "p < 0.01"  = "#7BAB3F",
-                                "p < 0.05"  = "#E0B85C",
-                                "n.s."      = "grey60")) +
+  scale_color_manual(values = sig_colors) +
   coord_cartesian(xlim = coef_xlim) +
   labs(title    = "Logistic regression coefficients (95% CI)",
        subtitle = plot_subtitle,
@@ -902,8 +918,8 @@ build_perm_imp_panel <- function(data, model_lbl) {
     geom_col(fill = bar_color) +
     geom_errorbar(aes(xmin = importance_mean - importance_sd,
                       xmax = importance_mean + importance_sd),
-                  width = 0.2, color = "grey30") +
-    geom_vline(xintercept = 0, color = "grey60", linewidth = 0.3) +
+                  width = 0.2, color = errorbar_color) +
+    geom_vline(xintercept = 0, color = reference_line_color, linewidth = 0.3) +
     facet_wrap(~ feature_set, nrow = 1) +
     labs(title = model_lbl, x = NULL, y = NULL) +
     theme(plot.title = element_text(face = "bold", size = 11))
