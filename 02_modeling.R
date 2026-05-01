@@ -528,24 +528,27 @@ print(p_thresh_sweep)
 # precision-recall curve, calibration plot, and a predicted-probability
 # density panel. Files: figures/models/perm_<wf_id>_<plot>.png.
 
-# 12a. Confusion matrix at default threshold
-plot_confusion <- function(preds, title) {
-  cm <- preds %>%
+# 12a. Confusion matrix at a specified threshold (default 0.5)
+plot_confusion <- function(preds, title, threshold = default_threshold) {
+  preds_thr <- preds %>%
+    mutate(.pred_class = factor(if_else(.pred_High >= threshold, "High", "Low"),
+                                levels = levels(high_popularity)))
+  cm <- preds_thr %>%
     conf_mat(truth = high_popularity, estimate = .pred_class)
   autoplot(cm, type = "heatmap") +
     scale_fill_gradient(low = "white", high = accent_primary) +
     labs(title    = title,
-         subtitle = sprintf("Confusion matrix at threshold = %.2f",
-                            default_threshold))
+         subtitle = sprintf("Confusion matrix at threshold = %.2f", threshold))
 }
 
-# 12b. ROC curve with AUC annotated
-plot_roc_one <- function(preds, title) {
+# 12b. ROC curve with AUC annotated; optional operating-point marker
+#      `op_point` is a one-row tibble with columns (threshold, fpr, tpr).
+plot_roc_one <- function(preds, title, op_point = NULL) {
   auc_val <- preds %>%
     roc_auc(truth = high_popularity, .pred_High) %>%
     pull(.estimate)
-  
-  preds %>%
+
+  p <- preds %>%
     roc_curve(truth = high_popularity, .pred_High) %>%
     ggplot(aes(x = 1 - specificity, y = sensitivity)) +
     geom_abline(slope = 1, intercept = 0, linetype = "dashed",
@@ -556,6 +559,20 @@ plot_roc_one <- function(preds, title) {
              label = sprintf("AUC = %.3f", auc_val)) +
     labs(title    = title, subtitle = "ROC curve, test set",
          x = "False positive rate", y = "True positive rate")
+
+  if (!is.null(op_point)) {
+    p <- p +
+      geom_point(data = op_point, aes(x = fpr, y = tpr),
+                 inherit.aes = FALSE,
+                 color = threshold_line_color, size = 3) +
+      geom_text(data = op_point,
+                aes(x = fpr, y = tpr,
+                    label = sprintf("CV-tuned thr = %.2f", threshold)),
+                inherit.aes = FALSE,
+                color = threshold_line_color,
+                vjust = -1.2, hjust = -0.1, size = 3.2)
+  }
+  p
 }
 
 # 12c. Precision-recall curve with average precision annotated
@@ -611,25 +628,57 @@ plot_proba_density <- function(preds, title) {
          x = "Predicted P(High)", y = "Density", fill = "True class")
 }
 
-# Build and save all per-model plots
+# Compute the (FPR, TPR) operating point at each workflow's CV-tuned threshold.
+# Stored once and reused: per-workflow ROC plots and the cross-model overlay.
+operating_points <- imap_dfr(test_predictions, function(p, wf_id) {
+  thr <- best_thresholds %>%
+    filter(workflow_id == wf_id) %>%
+    pull(best_threshold)
+  pred_class <- factor(if_else(p$.pred_High >= thr, "High", "Low"),
+                       levels = levels(p$high_popularity))
+  sens <- yardstick::sensitivity_vec(p$high_popularity, pred_class)
+  spec <- yardstick::specificity_vec(p$high_popularity, pred_class)
+  tibble(workflow_id = wf_id,
+         threshold   = thr,
+         fpr         = 1 - spec,
+         tpr         = sens)
+}) %>%
+  left_join(wf_meta, by = "workflow_id")
+
+# Build and save all per-model plots.
+# - confmat      : confusion matrix at default threshold (0.5)
+# - confmat_tuned: confusion matrix at CV-tuned threshold (per workflow)
+# - roc          : ROC curve with the CV-tuned operating point marked
+# - pr           : precision-recall curve
+# - calibration  : reliability diagram
+# - proba        : predicted-probability density by true class
 cat("\n--- Saving per-model plots ---\n")
-per_model_plot_fns <- list(
-  confmat     = plot_confusion,
-  roc         = plot_roc_one,
-  pr          = plot_pr_one,
-  calibration = plot_calibration,
-  proba       = plot_proba_density
-)
 
 for (wf_id in names(all_workflows)) {
   meta  <- wf_meta %>% filter(workflow_id == wf_id)
   ttl   <- sprintf("%s — %s", meta$model_label, meta$feature_set)
   preds <- test_predictions[[wf_id]]
-  for (pname in names(per_model_plot_fns)) {
-    p <- per_model_plot_fns[[pname]](preds, ttl)
-    ggsave(file.path(fig_dir, sprintf("perm_%s_%s.png", wf_id, pname)),
-           p, width = 5.5, height = 5, dpi = 150)
-  }
+  thr_t <- best_thresholds$best_threshold[best_thresholds$workflow_id == wf_id]
+  op_pt <- operating_points %>% filter(workflow_id == wf_id)
+
+  ggsave(file.path(fig_dir, sprintf("perm_%s_confmat.png", wf_id)),
+         plot_confusion(preds, ttl, default_threshold),
+         width = 5.5, height = 5, dpi = 150)
+  ggsave(file.path(fig_dir, sprintf("perm_%s_confmat_tuned.png", wf_id)),
+         plot_confusion(preds, ttl, thr_t),
+         width = 5.5, height = 5, dpi = 150)
+  ggsave(file.path(fig_dir, sprintf("perm_%s_roc.png", wf_id)),
+         plot_roc_one(preds, ttl, op_point = op_pt),
+         width = 5.5, height = 5, dpi = 150)
+  ggsave(file.path(fig_dir, sprintf("perm_%s_pr.png", wf_id)),
+         plot_pr_one(preds, ttl),
+         width = 5.5, height = 5, dpi = 150)
+  ggsave(file.path(fig_dir, sprintf("perm_%s_calibration.png", wf_id)),
+         plot_calibration(preds, ttl),
+         width = 5.5, height = 5, dpi = 150)
+  ggsave(file.path(fig_dir, sprintf("perm_%s_proba.png", wf_id)),
+         plot_proba_density(preds, ttl),
+         width = 5.5, height = 5, dpi = 150)
 }
 
 
@@ -648,11 +697,15 @@ p_roc_all <- all_roc %>%
   geom_abline(slope = 1, intercept = 0, linetype = "dashed",
               color = reference_line_color) +
   geom_path(linewidth = 0.9) +
+  geom_point(data = operating_points,
+             aes(x = fpr, y = tpr, color = model_label),
+             inherit.aes = FALSE, size = 2.6, shape = 21,
+             stroke = 1.1, fill = "white") +
   facet_wrap(~ feature_set) +
   scale_color_manual(values = model_colors) +
   coord_equal() +
   labs(title    = "ROC curves: all six models",
-       subtitle = "Test set; faceted by feature set",
+       subtitle = "Test set; points mark each workflow's CV-tuned operating threshold",
        x = "False positive rate", y = "True positive rate",
        color = NULL)
 ggsave(file.path(fig_dir, "all_roc_overlay.png"),
@@ -712,6 +765,79 @@ p_metrics <- metric_long %>%
 ggsave(file.path(fig_dir, "all_metric_comparison.png"),
        p_metrics, width = 12, height = 7, dpi = 150)
 print(p_metrics)
+
+# 13c-tuned. Same comparison at each workflow's CV-tuned threshold.
+# `roc_auc` is threshold-independent and is repeated from test_metrics so the
+# panel layout matches the default-0.5 figure.
+metric_long_tuned <- test_metrics_tuned %>%
+  left_join(test_metrics %>% select(workflow_id, roc_auc),
+            by = "workflow_id") %>%
+  select(model_label, feature_set,
+         accuracy, roc_auc, sensitivity, specificity, precision, f_meas) %>%
+  pivot_longer(c(accuracy, roc_auc, sensitivity, specificity,
+                 precision, f_meas),
+               names_to = "metric", values_to = "value") %>%
+  mutate(metric = recode(metric,
+                         accuracy    = "Accuracy",
+                         roc_auc     = "ROC AUC",
+                         sensitivity = "Sensitivity (Recall)",
+                         specificity = "Specificity",
+                         precision   = "Precision",
+                         f_meas      = "F1"))
+
+p_metrics_tuned <- metric_long_tuned %>%
+  ggplot(aes(x = model_label, y = value, fill = feature_set)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = sprintf("%.3f", value)),
+            position = position_dodge(width = 0.8),
+            vjust = -0.3, size = 2.8) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_fill_manual(values = fset_palette) +
+  scale_y_continuous(limits = c(0, NA),
+                     expand = expansion(mult = c(0, 0.18))) +
+  labs(title    = "Test-set metrics by model and feature set",
+       subtitle = "CV-tuned F1-optimal threshold per workflow (ROC AUC is threshold-independent)",
+       x = NULL, y = NULL, fill = "Feature set") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+ggsave(file.path(fig_dir, "all_metric_comparison_tuned.png"),
+       p_metrics_tuned, width = 12, height = 7, dpi = 150)
+print(p_metrics_tuned)
+
+# 13c-combined. Default 0.5 vs CV-tuned, on a single chart.
+# Each (model, feature_set) cell becomes two stacked bars distinguished by
+# `scheme`. ROC AUC bars are repeated identically across schemes (it is
+# threshold-independent) but kept in the panel so the visual stays comparable
+# to the single-scheme charts.
+metric_long_combined <- bind_rows(
+  metric_long           %>% mutate(scheme = "default (0.5)"),
+  metric_long_tuned     %>% mutate(scheme = "CV-tuned (F1)")
+) %>%
+  mutate(scheme = factor(scheme, levels = c("default (0.5)", "CV-tuned (F1)")),
+         group  = paste(feature_set, scheme, sep = " | "))
+
+# Color = feature_set; alpha = scheme (default 0.5 lighter, tuned darker).
+p_metrics_both <- metric_long_combined %>%
+  ggplot(aes(x = model_label, y = value, fill = feature_set, alpha = scheme)) +
+  geom_col(aes(group = group),
+           position = position_dodge(width = 0.85), width = 0.78,
+           color = "grey25", linewidth = 0.15) +
+  geom_text(aes(label = sprintf("%.2f", value), group = group),
+            position = position_dodge(width = 0.85),
+            vjust = -0.3, size = 2.4, alpha = 1) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_fill_manual(values = fset_palette) +
+  scale_alpha_manual(values = c("default (0.5)" = 0.45,
+                                "CV-tuned (F1)" = 1.0)) +
+  scale_y_continuous(limits = c(0, NA),
+                     expand = expansion(mult = c(0, 0.18))) +
+  labs(title    = "Test-set metrics: default 0.5 vs CV-tuned thresholds",
+       subtitle = "Lighter bars = default 0.5; solid bars = CV-tuned F1-optimal threshold per workflow",
+       x = NULL, y = NULL,
+       fill = "Feature set", alpha = "Threshold scheme") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+ggsave(file.path(fig_dir, "all_metric_comparison_combined.png"),
+       p_metrics_both, width = 13, height = 7.5, dpi = 150)
+print(p_metrics_both)
 
 # 13d. Calibration overlay
 all_calib <- imap_dfr(test_predictions, function(preds, wf_id) {
@@ -942,6 +1068,75 @@ ggsave(file.path(fig_dir, "interp_permutation_importance_all.png"),
 print(p_perm_imp)
 
 
+# ---- 14d. Partial dependence plots for the best workflow -------------------
+# Computed manually (no extra package dependency): for each focal feature,
+# sweep a quantile-spaced grid of feature values; for each grid value,
+# replace the feature in the full test set, predict, and average. The
+# resulting curve is the model's marginal expectation of P(High) as the
+# focal feature varies, holding the empirical distribution of the others.
+#
+# Restricted to the four audio features with the largest cross-model
+# permutation importance — these are the features the report uses to
+# motivate music-maker recommendations (loudness, instrumentalness,
+# acousticness, energy). Computed on the rf_genre workflow because that
+# is the headline best workflow.
+pdp_focal_features <- c("loudness", "instrumentalness", "acousticness", "energy")
+pdp_workflow_id    <- "rf_genre"
+pdp_n_grid         <- 30
+
+compute_pdp_manual <- function(workflow_obj, feature, data, n_grid = pdp_n_grid) {
+  feature_values <- data[[feature]]
+  grid_pts <- quantile(feature_values,
+                       probs = seq(0, 1, length.out = n_grid),
+                       names = FALSE, na.rm = TRUE)
+  grid_pts <- unique(grid_pts)
+
+  map_dfr(grid_pts, function(v) {
+    data_mod <- data
+    data_mod[[feature]] <- v
+    preds <- predict(workflow_obj, data_mod, type = "prob")$.pred_High
+    tibble(feature   = feature,
+           value     = v,
+           mean_pred = mean(preds))
+  })
+}
+
+cat(sprintf("\n--- Computing PDPs for top features in %s ---\n", pdp_workflow_id))
+tic <- Sys.time()
+pdp_workflow <- extract_workflow(last_fits[[pdp_workflow_id]])
+pdp_data <- map_dfr(pdp_focal_features, function(f) {
+  cat(sprintf("  [%s]\n", f))
+  compute_pdp_manual(pdp_workflow, f, test_data)
+})
+toc <- Sys.time()
+cat(sprintf("Elapsed: %s\n",
+            format(round(difftime(toc, tic, units = "mins"), 2))))
+
+# Marginal P(High) on the test set = the horizontal reference line.
+p_high_marginal <- mean(test_data$high_popularity == "High")
+
+# Preserve the user-specified facet order (largest-effect feature first).
+pdp_data <- pdp_data %>%
+  mutate(feature = factor(feature, levels = pdp_focal_features))
+
+p_pdp <- pdp_data %>%
+  ggplot(aes(x = value, y = mean_pred)) +
+  geom_hline(yintercept = p_high_marginal,
+             linetype = "dashed", color = reference_line_color) +
+  geom_line(linewidth = 0.9, color = accent_primary) +
+  geom_point(size = 1.1, color = accent_primary) +
+  facet_wrap(~ feature, scales = "free_x", ncol = 2) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(title    = "Partial dependence: top audio features (Random Forest, audio+genre)",
+       subtitle = sprintf("Mean P(High) on the test set when the focal feature is held at each value (n_grid = %d). Dashed line = marginal P(High) = %.3f.",
+                          pdp_n_grid, p_high_marginal),
+       x = "Feature value (raw scale)", y = "Mean predicted P(High)")
+
+ggsave(file.path(fig_dir, "pdp_rf_genre_top4.png"),
+       p_pdp, width = 11, height = 8, dpi = 150)
+print(p_pdp)
+
+
 # ---- 15. Save artifacts ----------------------------------------------------
 # Final fitted workflows (re-fit on full train) — handy for any downstream
 # script (e.g., the presentation deck builder) that wants to load and predict
@@ -957,6 +1152,8 @@ saveRDS(best_params_list, file.path(out_dir, "best_hyperparameters.rds"))
 saveRDS(best_thresholds,      file.path(out_dir, "best_thresholds.rds"))
 saveRDS(test_metrics_tuned,   file.path(out_dir, "test_metrics_tuned.rds"))
 saveRDS(threshold_comparison, file.path(out_dir, "threshold_comparison.rds"))
+saveRDS(operating_points,     file.path(out_dir, "operating_points.rds"))
+saveRDS(pdp_data,             file.path(out_dir, "pdp_rf_genre_top4.rds"))
 
 # Plain-text summary
 write_csv(test_metrics,
@@ -980,6 +1177,14 @@ cat("\n",
     "   best_thresholds.rds       - CV F1-optimal threshold per workflow\n",
     "   test_metrics_tuned.rds    - test-set metrics at CV-tuned thresholds\n",
     "   threshold_comparison.rds  - default-0.5 vs CV-tuned, side by side\n",
+    "   operating_points.rds      - (FPR, TPR) at each CV-tuned threshold\n",
+    "   pdp_rf_genre_top4.rds     - PDP curves for top features in rf_genre\n",
+    "------------------------------------------------------------\n",
+    " New figures from this run:\n",
+    "   all_metric_comparison_tuned.png    - tuned-threshold metric bars\n",
+    "   all_metric_comparison_combined.png - default 0.5 vs tuned, both shown\n",
+    "   perm_<wf>_confmat_tuned.png        - confusion matrices at tuned thr\n",
+    "   pdp_rf_genre_top4.png              - partial dependence, best workflow\n",
     "============================================================\n",
     sep = "")
 
